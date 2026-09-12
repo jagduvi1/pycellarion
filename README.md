@@ -2,6 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/pycellarion)](https://pypi.org/project/pycellarion/)
 [![CI](https://github.com/jagduvi1/pycellarion/actions/workflows/ci.yml/badge.svg)](https://github.com/jagduvi1/pycellarion/actions/workflows/ci.yml)
+[![Contract](https://github.com/jagduvi1/pycellarion/actions/workflows/contract.yml/badge.svg)](https://github.com/jagduvi1/pycellarion/actions/workflows/contract.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Async Python client for the [Cellarion](https://cellarion.app) wine-cellar
@@ -70,6 +71,20 @@ token = await client.async_create_api_token("My script", ["read", "consume"])
 
 Responses are returned as plain `dict`s (`JsonDict`); bodies over
 `MAX_BODY_BYTES` (4 MiB) are refused.
+
+## API contract
+
+The integration depends on a handful of endpoints and response shapes.
+`tests/contract/` pins them down and runs nightly against a real Cellarion
+server (see the Contract badge above), so a change on the server side is
+caught before it reaches users. Run them yourself against any server with a
+read-scoped token:
+
+```bash
+CELLARION_CONTRACT_URL=https://cellarion.app CELLARION_CONTRACT_TOKEN=cel_… pytest tests/contract
+```
+
+They never write: no bottle is consumed and no token is revoked.
 
 ## Development
 

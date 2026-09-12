@@ -38,6 +38,7 @@ packages = ["src/pycellarion"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--ignore=tests/contract"
 asyncio_mode = "auto"
 
 [tool.coverage.run]
