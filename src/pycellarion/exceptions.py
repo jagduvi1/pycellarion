@@ -25,3 +25,7 @@ class CellarionScopeError(CellarionApiError):
 
 class CellarionTokensNotSupported(CellarionApiError):
     """The server does not support personal API tokens."""
+
+
+class CellarionInventoryNotSupported(CellarionApiError):
+    """The server does not offer GET /api/inventory (it answered 403 or 404)."""

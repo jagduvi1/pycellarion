@@ -8,8 +8,11 @@ It never stores a password beyond the login it was created for.
 
 from __future__ import annotations
 
+import json as jsonlib
 import logging
+import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -18,6 +21,7 @@ import aiohttp
 from .exceptions import (
     CellarionApiError,
     CellarionAuthError,
+    CellarionInventoryNotSupported,
     CellarionPushForbidden,
     CellarionPushNotSupported,
     CellarionScopeError,
@@ -33,6 +37,40 @@ JsonDict = dict[str, Any]
 # error page or a misbehaving server, not data worth holding in memory.
 MAX_BODY_BYTES = 4 * 1024 * 1024
 
+# The whole-cellar inventory grows with the cellar: a few hundred bytes per
+# bottle plus the wines they reference. 32 MiB holds tens of thousands of
+# bottles; past that it is not a cellar but a misbehaving server.
+MAX_INVENTORY_BYTES = 32 * 1024 * 1024
+
+# Label thumbnails are small WebP renders; 2 MiB is generous.
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+# The only image URLs get_image() will fetch: a thumbnail on the instance's
+# public uploads mount. No scheme, host, query, "..", or other directory can
+# match, so a path taken from a server response can never steer the request
+# anywhere else. Use fullmatch(): "$" alone also matches before a final "\n".
+IMAGE_PATH_RE = re.compile(
+    r"^/api/uploads/thumbs/(processed|originals)/[A-Za-z0-9_-]+\.(png|jpe?g|webp)\.webp$"
+)
+
+_INVENTORY_PATH = "/api/inventory"
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryResult:
+    """Outcome of get_inventory().
+
+    ``data`` is the inventory object, or None when the server answered 304
+    (``not_modified``): the caller's copy for ``etag`` is still current.
+    ``etag`` is the validator to send next time, or None when the server
+    sent none.
+    """
+
+    data: JsonDict | None
+    etag: str | None
+    not_modified: bool
+
 
 async def _read_json(resp: aiohttp.ClientResponse, what: str) -> JsonDict:
     """Decode a JSON object body, mapping a non-JSON answer to an API error.
@@ -46,6 +84,40 @@ async def _read_json(resp: aiohttp.ClientResponse, what: str) -> JsonDict:
     except (aiohttp.ClientError, ValueError) as err:
         raise CellarionApiError(f"{what} response was not JSON") from err
     return data if isinstance(data, dict) else {}
+
+
+async def _read_capped(resp: aiohttp.ClientResponse, limit: int, what: str) -> bytes:
+    """Read a whole response body, refusing anything over ``limit`` bytes.
+
+    Content-Length is only a hint: a chunked answer has none, and a
+    compressed one announces less than it inflates to. The cap is therefore
+    enforced on the bytes as they arrive, and reading stops as soon as it is
+    passed, so an oversized body is never held in memory.
+    """
+    length = resp.content_length
+    if length is not None and length > limit:
+        raise CellarionApiError(f"{what} answered with {length} bytes; refusing to read it")
+    body = bytearray()
+    try:
+        async for chunk in resp.content.iter_chunked(_READ_CHUNK_BYTES):
+            body += chunk
+            if len(body) > limit:
+                raise CellarionApiError(f"{what} sent more than {limit} bytes; stopped reading")
+    except (aiohttp.ClientError, TimeoutError) as err:
+        raise CellarionApiError(f"{what} read failed: {err}") from err
+    return bytes(body)
+
+
+async def _status_error(resp: aiohttp.ClientResponse, method: str, path: str) -> CellarionApiError:
+    """Build the error for a non-success status, with the server's message if any."""
+    detail = ""
+    try:
+        detail = (await resp.json()).get("error", "")
+    except Exception:  # best-effort error body
+        detail = ""
+    return CellarionApiError(
+        f"{method} {path} returned status {resp.status}" + (f": {detail}" if detail else "")
+    )
 
 
 class CellarionClient:
@@ -109,36 +181,59 @@ class CellarionClient:
             raise CellarionApiError("No token in login response")
         return True
 
-    async def _send(self, method: str, path: str, json: JsonDict | None) -> aiohttp.ClientResponse:
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        json: JsonDict | None,
+        headers: dict[str, str] | None = None,
+    ) -> aiohttp.ClientResponse:
         """Issue one request, mapping transport errors to CellarionApiError."""
         try:
             return await self._session.request(
                 method,
                 f"{self._url}{path}",
-                headers={"Authorization": f"Bearer {self._token}"},
+                headers={"Authorization": f"Bearer {self._token}", **(headers or {})},
                 json=json,
                 timeout=aiohttp.ClientTimeout(total=30),
             )
         except (aiohttp.ClientError, TimeoutError) as err:
             raise CellarionApiError(f"Request failed: {err}") from err
 
-    async def _request(self, method: str, path: str, json: JsonDict | None = None) -> JsonDict:
-        """Make an authenticated API request with auto-retry on 401."""
+    async def _send_authenticated(
+        self,
+        method: str,
+        path: str,
+        json: JsonDict | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> aiohttp.ClientResponse:
+        """Send an authenticated request, logging in again once on a 401.
+
+        Returns the raw response with any status but 401; the caller reads
+        it and must close it. A static API token is never refreshed, so a
+        401 for one raises CellarionAuthError straight away.
+        """
         if not self._token:
             await self.authenticate()
 
-        resp = await self._send(method, path, json)
+        resp = await self._send(method, path, json, headers)
+        if resp.status != 401:
+            return resp
+        # Token expired — re-authenticate and retry once
+        _LOGGER.debug("Token expired, re-authenticating")
+        resp.close()
+        await self.authenticate()
+        resp = await self._send(method, path, json, headers)
+        if resp.status == 401:
+            resp.close()
+            raise CellarionAuthError("Authentication rejected after retry")
+        return resp
+
+    async def _request(self, method: str, path: str, json: JsonDict | None = None) -> JsonDict:
+        """Make an authenticated API request with auto-retry on 401."""
+        resp = await self._send_authenticated(method, path, json)
         # Always release the connection back to the pool, even on error paths.
         try:
-            if resp.status == 401:
-                # Token expired — re-authenticate and retry once
-                _LOGGER.debug("Token expired, re-authenticating")
-                resp.close()
-                await self.authenticate()
-                resp = await self._send(method, path, json)
-                if resp.status == 401:
-                    raise CellarionAuthError("Authentication rejected after retry")
-
             if resp.status == 403 and self._api_token:
                 # Valid token, missing scope — a config error; re-login won't help
                 raise CellarionScopeError(f"API token lacks the scope for {method} {path}")
@@ -146,15 +241,7 @@ class CellarionClient:
             # Accept the 2xx success range: action endpoints (e.g. consume) may
             # answer 201/204 rather than 200.
             if not 200 <= resp.status < 300:
-                detail = ""
-                try:
-                    detail = (await resp.json()).get("error", "")
-                except Exception:  # best-effort error body
-                    detail = ""
-                raise CellarionApiError(
-                    f"{method} {path} returned status {resp.status}"
-                    + (f": {detail}" if detail else "")
-                )
+                raise await _status_error(resp, method, path)
 
             # getattr keeps this working against test doubles that don't
             # implement content_length; real aiohttp always provides it.
@@ -254,6 +341,75 @@ class CellarionClient:
     async def get_peak_bottles(self, limit: int = 10) -> JsonDict:
         """Fetch bottles currently in their peak drink window."""
         return await self._request("GET", f"/api/bottles?maturity=peak&limit={int(limit)}")
+
+    async def get_inventory(self, etag: str | None = None) -> InventoryResult:
+        """Fetch every bottle in the user's cellars, with wines, racks and places.
+
+        Pass the ``etag`` of the copy you hold: when nothing changed the
+        server answers 304 and the result has ``not_modified=True`` and no
+        data, at almost no cost to either side. Raises
+        CellarionInventoryNotSupported when the server predates the endpoint
+        (it answers 404, or 403 to an API token), CellarionAuthError when the
+        credential is rejected, and CellarionApiError for anything else,
+        including a body over MAX_INVENTORY_BYTES or one that is not a JSON
+        object.
+        """
+        headers = {"If-None-Match": etag} if etag else None
+        resp = await self._send_authenticated("GET", _INVENTORY_PATH, headers=headers)
+        try:
+            if resp.status in (403, 404):
+                raise CellarionInventoryNotSupported(
+                    f"Server does not offer {_INVENTORY_PATH} (status {resp.status})"
+                )
+            new_etag = resp.headers.get("ETag") or None
+            if resp.status == 304:
+                return InventoryResult(data=None, etag=new_etag or etag, not_modified=True)
+            if resp.status != 200:
+                raise await _status_error(resp, "GET", _INVENTORY_PATH)
+
+            body = await _read_capped(resp, MAX_INVENTORY_BYTES, f"GET {_INVENTORY_PATH}")
+            try:
+                data = jsonlib.loads(body)
+            except ValueError as err:  # includes JSON and Unicode decode errors
+                raise CellarionApiError("Inventory response was not JSON") from err
+            if not isinstance(data, dict):
+                raise CellarionApiError("Inventory response was not a JSON object")
+            return InventoryResult(data=data, etag=new_etag, not_modified=False)
+        finally:
+            resp.close()
+
+    async def get_image(self, path: str) -> tuple[bytes, str]:
+        """Fetch a label thumbnail by the path an inventory entry gave for it.
+
+        Only a path matching IMAGE_PATH_RE is fetched; anything else raises
+        ValueError before any request is made. The uploads mount is public, so
+        the request carries no credential, and redirects are not followed.
+        Returns ``(body, content_type)``. Raises CellarionApiError on a
+        non-2xx status, a content type that is not a raster image, or a body
+        over MAX_IMAGE_BYTES.
+        """
+        if not IMAGE_PATH_RE.fullmatch(path):
+            raise ValueError(f"Not a Cellarion thumbnail path: {path!r}")
+        try:
+            resp = await self._session.get(
+                f"{self._url}{path}",
+                timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=False,
+            )
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise CellarionApiError(f"Image request failed: {err}") from err
+        try:
+            if not 200 <= resp.status < 300:
+                raise CellarionApiError(f"GET {path} returned status {resp.status}")
+            content_type = resp.content_type
+            kind = content_type.lower()
+            # SVG is an image/ type that can carry script; a thumbnail never is one
+            if not kind.startswith("image/") or kind.startswith("image/svg"):
+                raise CellarionApiError(f"GET {path} returned {content_type}, not an image")
+            body = await _read_capped(resp, MAX_IMAGE_BYTES, f"GET {path}")
+            return body, content_type
+        finally:
+            resp.close()
 
     async def consume_bottle(
         self,
