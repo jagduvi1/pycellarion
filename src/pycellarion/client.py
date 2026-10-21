@@ -94,7 +94,9 @@ async def _read_capped(resp: aiohttp.ClientResponse, limit: int, what: str) -> b
     enforced on the bytes as they arrive, and reading stops as soon as it is
     passed, so an oversized body is never held in memory.
     """
-    length = resp.content_length
+    # getattr: Home Assistant's test mock (AiohttpClientMockResponse) does not
+    # implement content_length; real aiohttp always provides it.
+    length = getattr(resp, "content_length", None)
     if length is not None and length > limit:
         raise CellarionApiError(f"{what} answered with {length} bytes; refusing to read it")
     body = bytearray()
