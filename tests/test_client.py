@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import json as jsonlib
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 import aiohttp
@@ -47,6 +48,11 @@ class FakeResponse:
         if self._json is None:
             raise ValueError("not json")
         return self._json
+
+    async def iter_chunked(self, n: int) -> AsyncIterator[bytes]:
+        # The client reads bodies in capped chunks; no json given = empty body
+        if self._json is not None:
+            yield jsonlib.dumps(self._json).encode()
 
     def close(self) -> None:
         self.closed = True

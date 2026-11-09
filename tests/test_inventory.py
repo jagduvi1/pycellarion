@@ -12,6 +12,7 @@ import pytest
 
 from pycellarion import (
     IMAGE_PATH_RE,
+    MAX_BODY_BYTES,
     MAX_IMAGE_BYTES,
     MAX_INVENTORY_BYTES,
     CellarionApiError,
@@ -354,3 +355,57 @@ async def test_image_connection_error(err: Exception) -> None:
     client, _ = token_client(err)
     with pytest.raises(CellarionApiError, match="Image request failed"):
         await client.get_image(THUMB)
+
+
+# ── Every read is capped; nothing follows a redirect ─────────────────
+
+DEEP = b"[" * 100_000  # json.loads raises RecursionError, not ValueError
+
+
+async def test_request_stops_reading_a_chunked_body_over_the_cap() -> None:
+    """No Content-Length (chunked) is no way past the cap."""
+    resp = BodyResponse(200, b'{"stats": "', filler=MAX_BODY_BYTES + 1)
+    client, _ = token_client(resp)
+    with pytest.raises(CellarionApiError, match="more than"):
+        await client.get_stats_overview()
+    assert resp.bytes_read <= MAX_BODY_BYTES + 64 * 1024
+    assert resp.closed
+
+
+async def test_deeply_nested_json_is_treated_as_not_json() -> None:
+    """A pathological document never escapes as RecursionError."""
+    client, _ = token_client(BodyResponse(200, DEEP))
+    assert await client.get_stats_overview() == {}
+
+    client, _ = token_client(BodyResponse(200, DEEP))
+    with pytest.raises(CellarionApiError, match="not JSON"):
+        await client.get_inventory()
+
+    client, _ = password_client(BodyResponse(200, DEEP))
+    with pytest.raises(CellarionApiError, match="not JSON"):
+        await client.authenticate()
+
+
+async def test_error_bodies_are_read_capped_and_trimmed() -> None:
+    """The server's message is shown, but never a megabyte of it."""
+    body = json.dumps({"error": "x" * 5000}).encode()
+    client, _ = token_client(BodyResponse(500, body))
+    with pytest.raises(CellarionApiError) as excinfo:
+        await client.get_stats_overview()
+    assert str(excinfo.value).endswith(": " + "x" * 200)
+
+
+async def test_requests_do_not_follow_redirects() -> None:
+    """A 307 would re-send a consume's note and rating to another host."""
+    client, session = token_client(FakeResponse(307))
+    with pytest.raises(CellarionApiError, match="redirected"):
+        await client.consume_bottle("a" * 24, note="for the anniversary")
+    assert session.calls[0][2]["allow_redirects"] is False
+
+
+async def test_event_stream_does_not_follow_redirects() -> None:
+    client, session = token_client(FakeResponse(302, content_type="text/html"))
+    with pytest.raises(CellarionApiError, match="status 302"):
+        async for _ in client.events_stream():
+            pass
+    assert session.calls[0][2]["allow_redirects"] is False
