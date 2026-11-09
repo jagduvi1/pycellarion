@@ -55,6 +55,22 @@ IMAGE_PATH_RE = re.compile(
 
 _INVENTORY_PATH = "/api/inventory"
 _READ_CHUNK_BYTES = 64 * 1024
+# An error body is read only for its message; a real one is a few bytes.
+_ERROR_BODY_BYTES = 64 * 1024
+_ERROR_DETAIL_CHARS = 200
+
+
+def _loads(body: bytes) -> Any:
+    """Decode JSON, treating pathological nesting like any other bad JSON.
+
+    json.loads raises RecursionError, not ValueError, for a deeply nested
+    document; a hostile or broken server must not get past the callers'
+    "not JSON" handling with it.
+    """
+    try:
+        return jsonlib.loads(body)
+    except RecursionError as err:
+        raise ValueError("JSON nested too deeply") from err
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,11 +93,13 @@ async def _read_json(resp: aiohttp.ClientResponse, what: str) -> JsonDict:
 
     A reverse proxy or SPA fallback can answer a 200 with an HTML page; that
     must surface as a normal (retryable) API error, not an unhandled
-    exception that marks the whole update as "unexpected".
+    exception that marks the whole update as "unexpected". The body is read
+    under MAX_BODY_BYTES like every other one.
     """
+    body = await _read_capped(resp, MAX_BODY_BYTES, what)
     try:
-        data = await resp.json()
-    except (aiohttp.ClientError, ValueError) as err:
+        data = _loads(body)
+    except ValueError as err:  # includes JSON and Unicode decode errors
         raise CellarionApiError(f"{what} response was not JSON") from err
     return data if isinstance(data, dict) else {}
 
@@ -114,7 +132,8 @@ async def _status_error(resp: aiohttp.ClientResponse, method: str, path: str) ->
     """Build the error for a non-success status, with the server's message if any."""
     detail = ""
     try:
-        detail = (await resp.json()).get("error", "")
+        body = await _read_capped(resp, _ERROR_BODY_BYTES, f"{method} {path}")
+        detail = str(_loads(body).get("error", ""))[:_ERROR_DETAIL_CHARS]
     except Exception:  # best-effort error body
         detail = ""
     return CellarionApiError(
@@ -190,7 +209,12 @@ class CellarionClient:
         json: JsonDict | None,
         headers: dict[str, str] | None = None,
     ) -> aiohttp.ClientResponse:
-        """Issue one request, mapping transport errors to CellarionApiError."""
+        """Issue one request, mapping transport errors to CellarionApiError.
+
+        Redirects are not followed: aiohttp drops the bearer token when one
+        leaves the origin, but a 307/308 would still re-send the body (a
+        consume's note and rating) to wherever it points.
+        """
         try:
             return await self._session.request(
                 method,
@@ -198,6 +222,7 @@ class CellarionClient:
                 headers={"Authorization": f"Bearer {self._token}", **(headers or {})},
                 json=json,
                 timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
             )
         except (aiohttp.ClientError, TimeoutError) as err:
             raise CellarionApiError(f"Request failed: {err}") from err
@@ -239,6 +264,11 @@ class CellarionClient:
             if resp.status == 403 and self._api_token:
                 # Valid token, missing scope — a config error; re-login won't help
                 raise CellarionScopeError(f"API token lacks the scope for {method} {path}")
+            if 300 <= resp.status < 400:
+                raise CellarionApiError(
+                    f"{method} {path} was redirected (status {resp.status}); "
+                    "configure the final instance URL"
+                )
 
             # Accept the 2xx success range: action endpoints (e.g. consume) may
             # answer 201/204 rather than 200.
@@ -250,13 +280,12 @@ class CellarionClient:
             length = getattr(resp, "content_length", None)
             if resp.status == 204 or length == 0:
                 return {}
-            if length is not None and length > MAX_BODY_BYTES:
-                raise CellarionApiError(
-                    f"{method} {path} answered with {length} bytes; refusing to read it"
-                )
+            # Capped as it arrives: a chunked or compressed body announces
+            # no (or a smaller) length.
+            body = await _read_capped(resp, MAX_BODY_BYTES, f"{method} {path}")
             try:
-                data = await resp.json()
-            except (aiohttp.ClientError, ValueError):
+                data = _loads(body)
+            except ValueError:
                 # No/!JSON body on a success status — nothing to return
                 return {}
             return data if isinstance(data, dict) else {}
@@ -371,7 +400,7 @@ class CellarionClient:
 
             body = await _read_capped(resp, MAX_INVENTORY_BYTES, f"GET {_INVENTORY_PATH}")
             try:
-                data = jsonlib.loads(body)
+                data = _loads(body)
             except ValueError as err:  # includes JSON and Unicode decode errors
                 raise CellarionApiError("Inventory response was not JSON") from err
             if not isinstance(data, dict):
@@ -452,7 +481,10 @@ class CellarionClient:
         timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_read=90)
 
         try:
-            resp = await self._session.get(url, headers=headers, timeout=timeout)
+            # No redirects, as in _send: a 3xx ends up as a status error below
+            resp = await self._session.get(
+                url, headers=headers, timeout=timeout, allow_redirects=False
+            )
         except (aiohttp.ClientError, TimeoutError) as err:
             raise CellarionApiError(f"Push stream connection failed: {err}") from err
 
@@ -461,7 +493,9 @@ class CellarionClient:
             await self.authenticate()
             headers["Authorization"] = f"Bearer {self._token}"
             try:
-                resp = await self._session.get(url, headers=headers, timeout=timeout)
+                resp = await self._session.get(
+                    url, headers=headers, timeout=timeout, allow_redirects=False
+                )
             except (aiohttp.ClientError, TimeoutError) as err:
                 raise CellarionApiError(f"Push stream retry failed: {err}") from err
             if resp.status == 401:

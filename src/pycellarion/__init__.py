@@ -19,7 +19,7 @@ from .exceptions import (
     CellarionTokensNotSupported,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "IMAGE_PATH_RE",
